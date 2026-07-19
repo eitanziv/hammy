@@ -23,6 +23,14 @@ def init(
         Path("."),
         help="Project root directory to initialize.",
     ),
+    claude_skill: bool = typer.Option(
+        False,
+        "--claude-skill",
+        help=(
+            "Also install the Claude Code skill at .claude/skills/hammy/SKILL.md. "
+            "Installed automatically when the project already has a .claude/ directory."
+        ),
+    ),
 ) -> None:
     """Initialize Hammy configuration in a project directory."""
     path = path.resolve()
@@ -78,9 +86,40 @@ def init(
         )
         console.print(f"  [green]created[/green] .hammyignore")
 
+    # HAMMY.md — agent-facing usage guide, referenced from the user's own
+    # CLAUDE.md / AGENTS.md / .cursorrules so we never touch those files.
+    from hammy.agent_docs import HAMMY_MD, REFERENCE_LINE, SKILL_MD
+
+    hammy_md = path / "HAMMY.md"
+    if hammy_md.exists():
+        console.print(f"  [yellow]exists[/yellow]  HAMMY.md")
+    else:
+        hammy_md.write_text(HAMMY_MD)
+        console.print(f"  [green]created[/green] HAMMY.md")
+
+    # Claude Code skill — thin trigger that points agents at HAMMY.md.
+    if claude_skill or (path / ".claude").is_dir():
+        skill_path = path / ".claude" / "skills" / "hammy" / "SKILL.md"
+        if skill_path.exists():
+            console.print(f"  [yellow]exists[/yellow]  .claude/skills/hammy/SKILL.md")
+        else:
+            skill_path.parent.mkdir(parents=True, exist_ok=True)
+            skill_path.write_text(SKILL_MD)
+            console.print(f"  [green]created[/green] .claude/skills/hammy/SKILL.md")
+    else:
+        console.print(
+            "  [dim]skipped[/dim] Claude Code skill (no .claude/ directory — "
+            "rerun with --claude-skill to install it)"
+        )
+
     console.print(f"\n[bold green]Hammy initialized in {path}[/bold green]")
     console.print("Edit hammy.yaml to set your project name, then edit config/agents.yaml to set your LLM provider.")
     console.print("Run [bold]hammy index[/bold] to index the codebase.")
+    console.print(
+        "\n[bold]Wire up your AI agent[/bold] — add this line to your "
+        "CLAUDE.md, AGENTS.md, .cursorrules, or CONTEXT.md:"
+    )
+    console.print(f"  [cyan]{REFERENCE_LINE}[/cyan]")
 
 
 @app.command()

@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from typing import Annotated, Literal
 
 from mcp.server import FastMCP
+from pydantic import Field
 
 from hammy.config import HammyConfig
 from hammy.exporters.redis_meta import RedisMetaClient
@@ -21,6 +23,102 @@ from hammy.tools.hybrid_search import BM25Index, build_bm25_index
 from hammy.tools.parser import ParserFactory
 from hammy.tools.qdrant_tools import QdrantManager
 from hammy.tools.vcs import VCSWrapper
+
+# Shared parameter annotations. Descriptions here are the ONLY parameter docs
+# the model ever sees — FastMCP builds the input schema from type hints and
+# discards docstring Args sections.
+LanguageFilter = Annotated[
+    Literal["php", "javascript", "typescript", "python", "go", "csharp"] | None,
+    Field(description="Restrict results to one language."),
+]
+NodeTypeFilter = Annotated[
+    Literal["class", "function", "method", "endpoint"] | None,
+    Field(description="Restrict results to one symbol kind."),
+]
+FileFilter = Annotated[
+    str,
+    Field(description="Case-insensitive path substring to restrict results, e.g. 'controllers/'."),
+]
+
+
+def _bare_name(name: str) -> str:
+    """Strip class/namespace qualifiers from a symbol name.
+
+    Node names are qualified ('QdrantManager.search_code', 'App\\UserController',
+    'Payment::charge') but call expressions only ever contain the bare member
+    name, so caller/callee matching must compare bare names.
+    """
+    return re.split(r"::|\\|\.", name)[-1]
+
+
+def _build_name_index(nodes: list[Node]) -> dict[str, list[Node]]:
+    """Index nodes by lowercased full name AND bare name.
+
+    Callee names extracted from call expressions are bare, so without the
+    bare-name keys, method nodes (named 'Class.method') never resolve.
+    """
+    index: dict[str, list[Node]] = {}
+    for n in nodes:
+        if n.type == NodeType.COMMENT:
+            continue
+        index.setdefault(n.name.lower(), []).append(n)
+        bare = _bare_name(n.name).lower()
+        if bare != n.name.lower():
+            index.setdefault(bare, []).append(n)
+    return index
+
+
+def _build_instructions(*, has_qdrant: bool, has_vcs: bool) -> str:
+    """Build server instructions listing only the tools that actually registered."""
+    parts: list[str] = [
+        "Hammy is a codebase intelligence engine with a pre-built symbol graph and call index."
+    ]
+
+    if has_qdrant:
+        parts.append(
+            "MEMORY — do this first and last:\n"
+            "  1. Before researching a topic, call recall_context — a prior session or "
+            "sub-agent may already have the answer.\n"
+            "  2. After any significant finding (entry point located, dependency mapped, "
+            "risk identified), call store_context immediately — don't wait until the end. "
+            "Future sub-agents and sessions depend on it."
+        )
+
+    parts.append(
+        "ORIENTATION:\n"
+        "  index_status first on an unfamiliar project, then module_summary to map a directory.\n\n"
+        "SEARCH — pick by what you know:\n"
+        "  exact name → lookup_symbol (accepts many names per call)\n"
+        "  approximate name → search_symbols\n"
+        "  no name, just keywords or a description → search_code_hybrid\n"
+        "  structural shape (visibility, param count, complexity) → structural_search"
+    )
+
+    change_line = (
+        "BEFORE ANY CHANGE:\n"
+        "  impact_analysis (blast radius) → hotspot_score (risk level)"
+    )
+    if has_qdrant:
+        change_line += " → store findings with store_context."
+    parts.append(change_line)
+
+    other = [
+        "explain_symbol: 360° view of one symbol — definition, direct callers/callees, "
+        "siblings, recent commits. For the complete caller list use find_usages; "
+        "for multi-hop blast radius use impact_analysis.",
+        "find_usages(argument_filter=...): filter call sites by what's passed in "
+        "(critical for DI codebases).",
+        "find_bridges: cross-language endpoint connections.",
+        "pr_diff: risk-rate a PR or uncommitted changes.",
+        "search_comments: surface 'don't touch this' / TODO warnings left in code.",
+    ]
+    if has_vcs:
+        other.append("git_log / git_blame / file_churn: ownership and stability context.")
+    if has_qdrant:
+        other.append("search_commits: find commits by meaning, not text match.")
+    parts.append("OTHER TOOLS:\n" + "\n".join(f"  {line}" for line in other))
+
+    return "\n\n".join(parts)
 
 
 def create_mcp_server(
@@ -90,23 +188,8 @@ def create_mcp_server(
     # Create MCP server
     mcp = FastMCP(
         name="hammy",
-        instructions=(
-            "Hammy is a codebase intelligence engine with a pre-built symbol graph and call index.\n\n"
-            "MEMORY — do this first and last:\n"
-            "  1. Start every investigation with recall_context to check if this has already been researched.\n"
-            "  2. After any significant finding (entry point located, dependency mapped, risk identified), "
-            "call store_context immediately — don't wait until the end. Future sub-agents and sessions depend on it.\n\n"
-            "SEARCH — default order:\n"
-            "  lookup_symbol (exact name) → search_symbols (fuzzy name) → search_code_hybrid (concept + name mixed).\n\n"
-            "BEFORE ANY CHANGE:\n"
-            "  impact_analysis (blast radius) → hotspot_score (risk level) → store findings in brain.\n\n"
-            "OTHER TOOLS:\n"
-            "  explain_symbol: full context on one symbol in one call — use before lookup_symbol + find_usages.\n"
-            "  module_summary: orient to a directory without opening files.\n"
-            "  find_usages(argument_filter=...): filter call sites by what's passed in (critical for DI codebases).\n"
-            "  find_bridges: cross-language endpoint connections.\n"
-            "  pr_diff: risk-rate a PR or uncommitted changes.\n"
-            "  structural_search: find symbols by shape (visibility, param count, complexity)."
+        instructions=_build_instructions(
+            has_qdrant=qdrant is not None, has_vcs=vcs is not None
         ),
     )
 
@@ -116,18 +199,21 @@ def create_mcp_server(
         name="ast_query",
         description=(
             "You know the file, now see what's in it. Returns every class, function, "
-            "method, endpoint, and import with line numbers, visibility, and LLM summaries. "
-            "Use query_type to focus: 'classes', 'functions', 'methods', 'endpoints', or 'imports'."
+            "method, endpoint, and import with line numbers, visibility, and summaries. "
+            "Parses the file fresh from disk, so it reflects edits made since the last "
+            "reindex. Use query_type to focus on one kind of symbol."
         ),
     )
-    def ast_query(file_path: str, query_type: str = "all") -> str:
-        """Query AST of a file.
-
-        Args:
-            file_path: Path to the file (relative to project root).
-            query_type: What to extract - 'all', 'classes', 'functions',
-                        'methods', 'endpoints', or 'imports'.
-        """
+    def ast_query(
+        file_path: Annotated[
+            str, Field(description="File path relative to the project root.")
+        ],
+        query_type: Annotated[
+            Literal["all", "classes", "functions", "methods", "endpoints", "imports"],
+            Field(description="Which symbols to extract; 'all' returns everything except imports."),
+        ] = "all",
+    ) -> str:
+        """Query the AST of a single file."""
         full_path = project_root / file_path
         if not full_path.exists():
             return f"File not found: {file_path}"
@@ -182,19 +268,14 @@ def create_mcp_server(
         ),
     )
     def search_symbols(
-        query: str,
-        language: str = "",
-        node_type: str = "",
-        file_filter: str = "",
+        query: Annotated[
+            str, Field(description="Symbol name fragment or keyword to search for.")
+        ],
+        language: LanguageFilter = None,
+        node_type: NodeTypeFilter = None,
+        file_filter: FileFilter = "",
     ) -> str:
-        """Search indexed code symbols with ranked results.
-
-        Args:
-            query: Search term (symbol name or keyword).
-            language: Optional language filter ('php', 'javascript', 'python', etc.).
-            node_type: Optional type filter ('class', 'function', 'method', 'endpoint').
-            file_filter: Optional path substring to restrict results (e.g. 'controllers/').
-        """
+        """Search indexed code symbols with ranked results."""
         query_lower = query.lower()
         scored: list[tuple[int, Node]] = []
 
@@ -241,20 +322,37 @@ def create_mcp_server(
     @mcp.tool(
         name="find_usages",
         description=(
-            "'Where is this called?' Use before changing a function signature, removing a method, "
-            "or any time you need to know every dependency before touching something. "
-            "Word-boundary matched — 'save' won't match 'saveAll' or 'isSaved'. "
-            "Returns the containing function + file:line for each call site. More reliable than grep."
+            "'Where is this called?' Returns the complete list of call sites — use before "
+            "changing a function signature or removing a method. Pass the bare name only "
+            "('charge', not 'PaymentService::charge'); matching is word-boundary and "
+            "case-insensitive, so 'save' won't match 'saveAll', but same-named methods on "
+            "other classes WILL match — check the returned call expressions. "
+            "More reliable than grep."
         ),
     )
-    def find_usages(symbol_name: str, file_filter: str = "", argument_filter: str = "") -> str:
-        """Find all callers of a function or method by exact name.
-
-        Args:
-            symbol_name: Exact name of the function/method to find call sites for.
-            file_filter: Optional path substring to restrict results (e.g. 'controllers/').
-            argument_filter: Optional substring to match against the call expression (e.g. 'Issue_Builder').
-        """
+    def find_usages(
+        symbol_name: Annotated[
+            str,
+            Field(
+                description=(
+                    "Bare function/method name to find call sites for — no Class:: or "
+                    "namespace prefix (call expressions only contain the bare name)."
+                )
+            ),
+        ],
+        file_filter: FileFilter = "",
+        argument_filter: Annotated[
+            str,
+            Field(
+                description=(
+                    "Substring matched against the full call expression — e.g. 'Issue_Builder' "
+                    "finds resolve(Issue_Builder::class) but not other resolve() calls. "
+                    "Critical for narrowing DI container calls."
+                )
+            ),
+        ] = "",
+    ) -> str:
+        """Find all callers of a function or method by exact name."""
         pattern = re.compile(r"\b" + re.escape(symbol_name) + r"\b", re.IGNORECASE)
         node_index = {n.id: n for n in all_nodes}
 
@@ -277,7 +375,8 @@ def create_mcp_server(
         if not callers:
             return (
                 f"No call sites of '{symbol_name}' found. "
-                "Check spelling (search is exact/word-boundary). "
+                "Check spelling (search is exact/word-boundary) and pass the bare method "
+                "name without any Class:: or namespace prefix. "
                 "Use search_symbols to find the definition first."
             )
 
@@ -295,87 +394,99 @@ def create_mcp_server(
     @mcp.tool(
         name="lookup_symbol",
         description=(
-            "You know the exact name — get the full definition: file, line range, parameters, "
-            "return type, visibility, async flag, and LLM summary. "
-            "Faster and more complete than search_symbols for known names. "
-            "Falls back to word-boundary partial match if no exact hit is found."
+            "You know the exact name(s) — get full definitions: file, line range, parameters, "
+            "return type, visibility, async flag, and summary. Accepts up to 20 names in one "
+            "call, so drill into every interesting search result at once instead of looping. "
+            "Falls back to word-boundary partial match per name. Definition only — for callers, "
+            "callees, and history too, use explain_symbol; unsure of spelling, use search_symbols."
         ),
     )
-    def lookup_symbol(name: str, node_type: str = "") -> str:
-        """Look up a symbol by exact name.
+    def lookup_symbol(
+        names: Annotated[
+            list[str],
+            Field(
+                description=(
+                    "Symbol names to look up, case-insensitive — "
+                    "e.g. ['UserController', 'PaymentService']. Max 20."
+                )
+            ),
+        ],
+        node_type: NodeTypeFilter = None,
+    ) -> str:
+        """Look up one or more symbols by exact name."""
+        name_list = [n.strip() for n in names if n.strip()][:20]
+        if not name_list:
+            return "Provide at least one symbol name."
 
-        Args:
-            name: Exact symbol name to look up (case-insensitive).
-            node_type: Optional type filter ('class', 'function', 'method', 'endpoint').
-        """
-        name_lower = name.lower()
-        matches = [
-            n for n in all_nodes
-            if n.type != NodeType.COMMENT
-            and n.name.lower() == name_lower
-            and (not node_type or n.type.value == node_type)
-        ]
-
-        if not matches:
-            # Fall back to word-boundary partial match
-            pattern = re.compile(r"\b" + re.escape(name) + r"\b", re.IGNORECASE)
+        results: list[str] = []
+        for name in name_list:
+            name_lower = name.lower()
             matches = [
                 n for n in all_nodes
                 if n.type != NodeType.COMMENT
-                and pattern.search(n.name)
+                and n.name.lower() == name_lower
                 and (not node_type or n.type.value == node_type)
             ]
-            if not matches:
-                return (
-                    f"Symbol '{name}' not found. "
-                    "Try search_symbols for fuzzy matching."
-                )
-            prefix = f"No exact match for '{name}', showing word-boundary matches:\n"
-        else:
+
             prefix = ""
+            if not matches:
+                # Fall back to word-boundary partial match
+                pattern = re.compile(r"\b" + re.escape(name) + r"\b", re.IGNORECASE)
+                matches = [
+                    n for n in all_nodes
+                    if n.type != NodeType.COMMENT
+                    and pattern.search(n.name)
+                    and (not node_type or n.type.value == node_type)
+                ]
+                if not matches:
+                    results.append(
+                        f"Symbol '{name}' not found. "
+                        "Try search_symbols for fuzzy matching."
+                    )
+                    continue
+                prefix = f"No exact match for '{name}', showing word-boundary matches:\n"
 
-        lines = [prefix] if prefix else []
-        for n in matches[:20]:
-            line = f"{n.type.value}: {n.name}"
-            line += f"\n  file: {n.loc.file}:{n.loc.lines[0]}-{n.loc.lines[1]}"
-            line += f"\n  language: {n.language}"
-            if n.meta.visibility:
-                line += f"\n  visibility: {n.meta.visibility}"
-            if n.meta.parameters:
-                line += f"\n  params: {', '.join(n.meta.parameters)}"
-            if n.meta.return_type:
-                line += f"\n  returns: {n.meta.return_type}"
-            if n.meta.is_async:
-                line += "\n  async: true"
-            if n.summary:
-                line += f"\n  summary: {n.summary}"
-            if redis_meta:
-                line += redis_meta.format_meta(n.id)
-            lines.append(line)
+            lines = [prefix] if prefix else []
+            for n in matches[:10]:
+                line = f"{n.type.value}: {n.name}"
+                line += f"\n  file: {n.loc.file}:{n.loc.lines[0]}-{n.loc.lines[1]}"
+                line += f"\n  language: {n.language}"
+                if n.meta.visibility:
+                    line += f"\n  visibility: {n.meta.visibility}"
+                if n.meta.parameters:
+                    line += f"\n  params: {', '.join(n.meta.parameters)}"
+                if n.meta.return_type:
+                    line += f"\n  returns: {n.meta.return_type}"
+                if n.meta.is_async:
+                    line += "\n  async: true"
+                if n.summary:
+                    line += f"\n  summary: {n.summary}"
+                if redis_meta:
+                    line += redis_meta.format_meta(n.id)
+                lines.append(line)
+            results.append("\n\n".join(lines))
 
-        return "\n\n".join(lines)
+        return "\n---\n".join(results)
 
     @mcp.tool(
         name="explain_symbol",
         description=(
-            "Deep dive on one symbol in a single call — replaces lookup_symbol + find_usages + "
-            "impact_analysis + ast_query. Returns full definition, direct callers, direct callees, "
-            "sibling symbols in the same file, and recent commits. "
-            "Use whenever you need full context on any symbol."
+            "360° view of one symbol in a single call: full definition, direct (1-hop) callers "
+            "and callees, sibling symbols in the same file, attached comments, and recent commits. "
+            "Best first move when investigating any specific symbol. Shows at most 10 callers/callees — "
+            "for the complete call-site list use find_usages; for multi-hop blast radius before "
+            "a change use impact_analysis."
         ),
     )
-    def explain_symbol(name: str) -> str:
-        """Get full context for a symbol in one call.
-
-        Args:
-            name: Exact symbol name to explain (case-insensitive).
-        """
+    def explain_symbol(
+        name: Annotated[
+            str, Field(description="Exact symbol name to explain, case-insensitive.")
+        ],
+    ) -> str:
+        """Get full context for a symbol in one call."""
         name_lower = name.lower()
         node_index = {n.id: n for n in all_nodes}
-        name_index: dict[str, list[Node]] = {}
-        for n in all_nodes:
-            if n.type != NodeType.COMMENT:
-                name_index.setdefault(n.name.lower(), []).append(n)
+        name_index = _build_name_index(all_nodes)
 
         matches = name_index.get(name_lower, [])
         if not matches:
@@ -406,10 +517,9 @@ def create_mcp_server(
                 if meta_line:
                     lines.append(meta_line)
 
-            # Direct callers (depth=1)
-            # Use bare name (last segment after :: or \) since call expressions
-            # contain only the method name, not the fully-qualified node name
-            bare_name = re.split(r"::|\\", sym.name)[-1]
+            # Direct callers (depth=1) — match by bare name since call
+            # expressions contain only the member name, never the qualifier
+            bare_name = _bare_name(sym.name)
             caller_pattern = re.compile(r"\b" + re.escape(bare_name) + r"\b", re.IGNORECASE)
             callers = []
             for edge in call_edges:
@@ -459,7 +569,7 @@ def create_mcp_server(
                     lines.append(f"  {s.type.value}: {s.name}{vis} (line {s.loc.lines[0]})")
 
             # Comments hint
-            bare_name = re.split(r"::|\\|\.", sym.name)[-1]
+            bare_name = _bare_name(sym.name)
             attached_comments = [
                 n for n in all_nodes
                 if n.type == NodeType.COMMENT and n.meta.parent_symbol == sym.name
@@ -492,26 +602,24 @@ def create_mcp_server(
     @mcp.tool(
         name="module_summary",
         description=(
-            "Orient yourself on a directory without calling ast_query on every file. "
-            "Groups all symbols under a directory into a structured table of contents: "
-            "classes with nested methods, then standalone functions. "
-            "Replaces list_files + N×ast_query for module-level exploration."
+            "Orient yourself on a directory without opening files. Groups all symbols under "
+            "a path into a structured table of contents: classes with nested methods, then "
+            "standalone functions. Use instead of calling ast_query on every file when "
+            "exploring an unfamiliar module."
         ),
     )
     def module_summary(
-        directory: str,
-        max_per_file: int = 10,
-        node_type: str = "",
-        language: str = "",
+        directory: Annotated[
+            str,
+            Field(description="Directory path prefix to summarise, e.g. 'app/Services/'."),
+        ],
+        max_per_file: Annotated[
+            int, Field(description="Maximum symbols to show per file.")
+        ] = 10,
+        node_type: NodeTypeFilter = None,
+        language: LanguageFilter = None,
     ) -> str:
-        """Summarise all symbols in a directory.
-
-        Args:
-            directory: Directory path prefix to filter by (e.g. 'app/Services/').
-            max_per_file: Maximum symbols to show per file (default 10).
-            node_type: Optional type filter ('class', 'function', 'method', 'endpoint').
-            language: Optional language filter.
-        """
+        """Summarise all symbols in a directory."""
         dir_norm = directory.rstrip("/") + "/"
         by_file: dict[str, list[Node]] = {}
         for n in all_nodes:
@@ -588,69 +696,16 @@ def create_mcp_server(
         return "\n".join(lines).rstrip()
 
     @mcp.tool(
-        name="lookup_symbols_batch",
-        description=(
-            "Look up multiple symbols in one call. Pass a comma-separated list of names "
-            "to get full definitions for all of them at once. "
-            "Replaces N×lookup_symbol after a search result. Cap: 20 names."
-        ),
-    )
-    def lookup_symbols_batch(names: str) -> str:
-        """Look up multiple symbols by name in one call.
-
-        Args:
-            names: Comma-separated symbol names to look up (e.g. 'UserController, PaymentService').
-        """
-        name_list = [n.strip() for n in names.split(",") if n.strip()][:20]
-        if not name_list:
-            return "Provide at least one symbol name."
-
-        results: list[str] = []
-        for name in name_list:
-            name_lower = name.lower()
-            matches = [n for n in all_nodes if n.type != NodeType.COMMENT and n.name.lower() == name_lower]
-            if not matches:
-                pattern = re.compile(r"\b" + re.escape(name) + r"\b", re.IGNORECASE)
-                matches = [n for n in all_nodes if n.type != NodeType.COMMENT and pattern.search(n.name)]
-            if not matches:
-                results.append(f"Symbol '{name}' not found.")
-                continue
-            lines = []
-            for n in matches[:5]:
-                line = f"{n.type.value}: {n.name}"
-                line += f"\n  file: {n.loc.file}:{n.loc.lines[0]}-{n.loc.lines[1]}"
-                line += f"\n  language: {n.language}"
-                if n.meta.visibility:
-                    line += f"\n  visibility: {n.meta.visibility}"
-                if n.meta.parameters:
-                    line += f"\n  params: {', '.join(n.meta.parameters)}"
-                if n.meta.return_type:
-                    line += f"\n  returns: {n.meta.return_type}"
-                if n.meta.is_async:
-                    line += "\n  async: true"
-                if n.summary:
-                    line += f"\n  summary: {n.summary}"
-                if redis_meta:
-                    line += redis_meta.format_meta(n.id)
-                lines.append(line)
-            results.append("\n\n".join(lines))
-
-        return "\n---\n".join(results)
-
-    @mcp.tool(
         name="list_files",
         description=(
-            "Orient yourself on an unfamiliar codebase. Shows every indexed file with its language. "
-            "Good first call to understand scope before searching, or to find which directory "
-            "contains a subsystem you're about to explore."
+            "List every indexed file with its language. Use to find which directory holds "
+            "a subsystem, or to check whether a specific file made it into the index. "
+            "For overall stats use index_status; for a symbol-level view of one directory "
+            "use module_summary."
         ),
     )
-    def list_files(language: str = "") -> str:
-        """List indexed files.
-
-        Args:
-            language: Optional language filter ('php' or 'javascript').
-        """
+    def list_files(language: LanguageFilter = None) -> str:
+        """List indexed files."""
         files: dict[str, set[str]] = {}
         for node in all_nodes:
             if language and node.language != language:
@@ -672,29 +727,39 @@ def create_mcp_server(
         description=(
             "'If I change this, what breaks?' Traverses the call graph N hops deep to map the full "
             "dependency chain — not just direct callers but everything downstream. "
+            "Pass the bare name only ('charge', not 'PaymentService::charge'). "
             "Use direction='callers' (default) before any refactor; direction='callees' to see what "
             "a symbol depends on; direction='both' for the full neighbourhood. "
             "Turns 'I hope I found everything' into a concrete list."
         ),
     )
     def impact_analysis(
-        symbol_name: str,
-        depth: int = 3,
-        direction: str = "callers",
+        symbol_name: Annotated[
+            str,
+            Field(
+                description=(
+                    "Bare function/method name to analyse — no Class:: or namespace prefix."
+                )
+            ),
+        ],
+        depth: Annotated[
+            int,
+            Field(description="How many hops to traverse: 1 = direct only; clamped to 1-6."),
+        ] = 3,
+        direction: Annotated[
+            Literal["callers", "callees", "both"],
+            Field(
+                description=(
+                    "'callers' = what breaks if this changes; 'callees' = what it depends on; "
+                    "'both' = full neighbourhood."
+                )
+            ),
+        ] = "callers",
     ) -> str:
-        """Analyse the call-graph blast radius of a symbol.
-
-        Args:
-            symbol_name: Exact name of the function/method to analyse.
-            depth: How many hops to traverse (1=direct only, default 3, max 6).
-            direction: 'callers', 'callees', or 'both'.
-        """
+        """Analyse the call-graph blast radius of a symbol."""
         depth = max(1, min(depth, 6))
-        pattern = re.compile(r"\b" + re.escape(symbol_name) + r"\b", re.IGNORECASE)
         node_index = {n.id: n for n in all_nodes}
-        name_index: dict[str, list[Node]] = {}
-        for n in all_nodes:
-            name_index.setdefault(n.name.lower(), []).append(n)
+        name_index = _build_name_index(all_nodes)
 
         call_edges = [e for e in all_edges if e.relation == RelationType.CALLS]
 
@@ -703,7 +768,7 @@ def create_mcp_server(
             # Call contexts contain only the bare method name (e.g. "sendPersonalInvite"),
             # not the fully-qualified name, so strip namespace/class prefix before matching.
             pats = {
-                n: re.compile(r"\b" + re.escape(re.split(r"::|\\|\.", n)[-1]) + r"\b", re.IGNORECASE)
+                n: re.compile(r"\b" + re.escape(_bare_name(n)) + r"\b", re.IGNORECASE)
                 for n in names
             }
             for edge in call_edges:
@@ -811,33 +876,36 @@ def create_mcp_server(
         ),
     )
     def structural_search(
-        node_type: str = "",
-        language: str = "",
-        visibility: str = "",
-        async_only: bool = False,
-        min_params: int = 0,
-        max_params: int = -1,
-        return_type: str = "",
-        name_pattern: str = "",
-        file_filter: str = "",
-        min_complexity: int = 0,
-        limit: int = 50,
+        node_type: NodeTypeFilter = None,
+        language: LanguageFilter = None,
+        visibility: Annotated[
+            Literal["public", "private", "protected"] | None,
+            Field(description="Restrict to one visibility level."),
+        ] = None,
+        async_only: Annotated[
+            bool, Field(description="If true, return only async functions/methods.")
+        ] = False,
+        min_params: Annotated[
+            int, Field(description="Minimum number of parameters; 0 = no minimum.")
+        ] = 0,
+        max_params: Annotated[
+            int, Field(description="Maximum number of parameters; -1 = no limit.")
+        ] = -1,
+        return_type: Annotated[
+            str,
+            Field(description="Substring match on return type, e.g. 'bool', 'void', 'User'."),
+        ] = "",
+        name_pattern: Annotated[
+            str,
+            Field(description="Regex matched against symbol names, case-insensitive — e.g. '^get'."),
+        ] = "",
+        file_filter: FileFilter = "",
+        min_complexity: Annotated[
+            int, Field(description="Minimum complexity score; 0 = no minimum.")
+        ] = 0,
+        limit: Annotated[int, Field(description="Maximum results; capped at 200.")] = 50,
     ) -> str:
-        """Filter symbols by structural metadata.
-
-        Args:
-            node_type: 'class', 'function', 'method', or 'endpoint'.
-            language: Language filter ('php', 'javascript', 'python', etc.).
-            visibility: 'public', 'private', or 'protected'.
-            async_only: If true, return only async functions/methods.
-            min_params: Minimum number of parameters (0 = no minimum).
-            max_params: Maximum number of parameters (-1 = no limit).
-            return_type: Substring match on return type (e.g. 'bool', 'void', 'User').
-            name_pattern: Regex pattern to match symbol names.
-            file_filter: Path substring to restrict results (e.g. 'controllers/').
-            min_complexity: Minimum complexity score (0 = no minimum).
-            limit: Maximum results (capped at 200).
-        """
+        """Filter symbols by structural metadata."""
         limit = min(limit, 200)
         name_re = re.compile(name_pattern, re.IGNORECASE) if name_pattern else None
         results: list[Node] = []
@@ -925,26 +993,24 @@ def create_mcp_server(
         description=(
             "Before touching a subsystem, run this. Score = log(callers) × log(churn). "
             "High score = heavily depended on AND frequently modified = highest risk to touch. "
-            "Score near 0 = safe island. Use file_filter to focus on the area you're about to change. "
+            "Score near 0 = safe island. Without VCS, ranks by caller count only. "
+            "Use file_filter to focus on the area you're about to change. "
             "Pairs well with impact_analysis: hotspot tells you risk, impact tells you blast radius."
         ),
     )
     def hotspot_score(
-        top_n: int = 20,
-        node_type: str = "",
-        language: str = "",
-        file_filter: str = "",
-        window_days: int = 90,
+        top_n: Annotated[
+            int, Field(description="Number of top hotspots to return; capped at 50.")
+        ] = 20,
+        node_type: NodeTypeFilter = None,
+        language: LanguageFilter = None,
+        file_filter: FileFilter = "",
+        window_days: Annotated[
+            int,
+            Field(description="Churn lookback window in days; ignored when no VCS is available."),
+        ] = 90,
     ) -> str:
-        """Compute composite hotspot scores for code symbols.
-
-        Args:
-            top_n: Number of top hotspots to return (capped at 50).
-            node_type: Optional type filter ('function', 'method', 'class').
-            language: Optional language filter.
-            file_filter: Optional path substring to restrict results.
-            window_days: Churn lookback window in days (requires VCS).
-        """
+        """Compute composite hotspot scores for code symbols."""
         from hammy.tools.hotspot import compute_hotspots
 
         top_n = min(top_n, 50)
@@ -961,8 +1027,8 @@ def create_mcp_server(
             all_nodes,
             all_edges,
             file_churn=file_churn,
-            node_type=node_type,
-            language=language,
+            node_type=node_type or "",
+            language=language or "",
             file_filter=file_filter,
             top_n=top_n,
         )
@@ -1010,19 +1076,17 @@ def create_mcp_server(
         ),
     )
     def search_comments(
-        pattern: str = "",
-        symbol: str = "",
-        file_filter: str = "",
-        limit: int = 50,
+        pattern: Annotated[
+            str, Field(description="Substring/keyword to match within comment text.")
+        ] = "",
+        symbol: Annotated[
+            str,
+            Field(description="Restrict to comments attached to this symbol (word-boundary match)."),
+        ] = "",
+        file_filter: FileFilter = "",
+        limit: Annotated[int, Field(description="Maximum results to return.")] = 50,
     ) -> str:
-        """Search indexed code comments.
-
-        Args:
-            pattern: Substring/keyword to match within comment text.
-            symbol: Filter by parent symbol name (word-boundary match).
-            file_filter: Filter by file path substring.
-            limit: Maximum results to return (default 50).
-        """
+        """Search indexed code comments."""
         comment_nodes = [n for n in all_nodes if n.type == NodeType.COMMENT]
 
         if pattern:
@@ -1048,9 +1112,10 @@ def create_mcp_server(
     @mcp.tool(
         name="index_status",
         description=(
-            "Quick orientation: total symbols, files, edges, and languages indexed. "
-            "Call first on an unfamiliar project, or to confirm the index is populated "
-            "before running searches that would silently return nothing on an empty index."
+            "Start here on an unfamiliar project. Shows total symbols, files, edges, and "
+            "languages indexed, plus any stored memory entries. Also confirms the index is "
+            "populated before running searches that would silently return nothing on an "
+            "empty index."
         ),
     )
     def index_status() -> str:
@@ -1101,20 +1166,32 @@ def create_mcp_server(
         name="reindex",
         description=(
             "You've edited files while the server is running and searches are returning stale results. "
-            "Refreshes the in-memory symbol index. Set update_qdrant=true to also refresh semantic "
-            "embeddings (slower, needed for search_code/search_code_hybrid to reflect changes). "
+            "Refreshes the in-memory symbol index. Set update_qdrant=true to also refresh the "
+            "semantic embeddings behind search_code_hybrid (slower). "
             "Set enrich=true to generate LLM summaries for newly indexed symbols."
         ),
     )
-    def reindex(update_qdrant: bool = False, enrich: bool = False) -> str:
-        """Re-index the codebase.
-
-        Args:
-            update_qdrant: If true, also update Qdrant embeddings (slower).
-                          If false, only refreshes the in-memory symbol index.
-            enrich: If true, generate LLM summaries for symbols after indexing.
-                   Requires update_qdrant=true and a configured API key.
-        """
+    def reindex(
+        update_qdrant: Annotated[
+            bool,
+            Field(
+                description=(
+                    "If true, also update Qdrant embeddings (slower); if false, only "
+                    "refresh the in-memory symbol index."
+                )
+            ),
+        ] = False,
+        enrich: Annotated[
+            bool,
+            Field(
+                description=(
+                    "If true, generate LLM summaries for symbols after indexing. "
+                    "Requires update_qdrant=true and a configured API key."
+                )
+            ),
+        ] = False,
+    ) -> str:
+        """Re-index the codebase."""
         store = update_qdrant and qdrant is not None
 
         if update_qdrant and qdrant is None:
@@ -1171,13 +1248,16 @@ def create_mcp_server(
                 "maintained, recently broken, or untouched for years."
             ),
         )
-        def git_log(file_path: str = "", limit: int = 20) -> str:
-            """Get VCS commit log.
-
-            Args:
-                file_path: Optional path to filter commits (empty for all).
-                limit: Maximum number of commits to return.
-            """
+        def git_log(
+            file_path: Annotated[
+                str,
+                Field(description="Path to filter commits by; empty for the whole repo."),
+            ] = "",
+            limit: Annotated[
+                int, Field(description="Maximum number of commits to return.")
+            ] = 20,
+        ) -> str:
+            """Get VCS commit log."""
             path = file_path if file_path else None
             commits = vcs.log(path=path, limit=limit)
 
@@ -1204,12 +1284,12 @@ def create_mcp_server(
                 "or checking if a suspicious line was recent or ancient."
             ),
         )
-        def git_blame(file_path: str) -> str:
-            """Get blame data for a file.
-
-            Args:
-                file_path: Path to the file to blame.
-            """
+        def git_blame(
+            file_path: Annotated[
+                str, Field(description="Path of the file to blame, relative to the project root.")
+            ],
+        ) -> str:
+            """Get blame data for a file."""
             try:
                 blame_lines = vcs.blame(file_path)
             except RuntimeError as e:
@@ -1234,12 +1314,12 @@ def create_mcp_server(
                 "Feeds into hotspot_score when you need per-symbol risk rather than per-file."
             ),
         )
-        def file_churn(window_days: int = 90) -> str:
-            """Analyze file change frequency.
-
-            Args:
-                window_days: How many days back to analyze (default: 90).
-            """
+        def file_churn(
+            window_days: Annotated[
+                int, Field(description="How many days of history to analyze.")
+            ] = 90,
+        ) -> str:
+            """Analyze file change frequency."""
             churn = vcs.churn(window_days=window_days)
 
             if not churn:
@@ -1265,23 +1345,37 @@ def create_mcp_server(
         ),
     )
     def pr_diff(
-        diff_text: str = "",
-        base_ref: str = "",
-        head_ref: str = "",
-        working_tree: bool = False,
-        depth: int = 2,
+        diff_text: Annotated[
+            str,
+            Field(description="Raw unified diff text, pasted from git diff or GitHub."),
+        ] = "",
+        base_ref: Annotated[
+            str,
+            Field(
+                description=(
+                    "Base git ref to diff from, e.g. 'main' or 'HEAD~1'. "
+                    "Used when diff_text is empty and VCS is available."
+                )
+            ),
+        ] = "",
+        head_ref: Annotated[
+            str,
+            Field(description="Head ref to diff to; defaults to working tree / HEAD."),
+        ] = "",
+        working_tree: Annotated[
+            bool,
+            Field(
+                description=(
+                    "If true, diff the working tree against base_ref (or HEAD) — "
+                    "use this to analyse uncommitted changes automatically."
+                )
+            ),
+        ] = False,
+        depth: Annotated[
+            int, Field(description="Caller traversal depth for impact analysis.")
+        ] = 2,
     ) -> str:
-        """Analyse a diff and return symbol-level impact.
-
-        Args:
-            diff_text: Raw unified diff text (paste from git diff / GitHub).
-            base_ref: Base git ref to diff from (e.g. 'main', 'HEAD~1').
-                      Used when diff_text is empty and VCS is available.
-            head_ref: Head ref to diff to (default: working tree / HEAD).
-            working_tree: If True, diff the working tree against base_ref (or HEAD).
-                          Use this to analyse uncommitted changes automatically.
-            depth: Caller traversal depth for impact analysis (default 2).
-        """
+        """Analyse a diff and return symbol-level impact."""
         from hammy.tools.diff_analysis import analyze_diff
 
         raw_diff = diff_text.strip()
@@ -1380,79 +1474,37 @@ def create_mcp_server(
 
         return "\n".join(lines)
 
-    # --- Semantic Search Tools (require Qdrant) ---
+    # --- Keyword / Semantic Search ---
 
     if qdrant is not None:
-
-        @mcp.tool(
-            name="search_code",
-            description=(
-                "You don't know the symbol name — describe what you're looking for in plain language. "
-                "'authentication logic', 'email sending', 'database connection pooling'. "
-                "Uses MMR so you get diverse results across different files rather than 5 variants "
-                "of the same thing. For known names, use lookup_symbol or search_symbols."
-            ),
+        hybrid_description = (
+            "You don't know the symbol name — search by keywords, a plain-language description, "
+            "or both mixed: 'sendPersonalInvite email logic', 'authentication middleware'. "
+            "Combines BM25 keyword matching (catches exact identifiers) with semantic embeddings "
+            "(catches synonyms and concepts), merged via RRF. Default search whenever you don't "
+            "have a name for lookup_symbol or search_symbols."
         )
-        def search_code(
-            query: str,
-            limit: int = 10,
-            language: str = "",
-            node_type: str = "",
-        ) -> str:
-            """Semantic code search with MMR diversity via Qdrant.
+    else:
+        hybrid_description = (
+            "You don't know the exact symbol name — search by keywords over symbol names, "
+            "summaries, and file paths (BM25 ranked). Semantic matching is currently unavailable "
+            "(Qdrant offline), so use words likely to appear in the code, not abstract concepts. "
+            "If you know the exact name, lookup_symbol is faster."
+        )
 
-            Args:
-                query: Natural language description of what you're looking for.
-                limit: Maximum results to return (capped at 20).
-                language: Optional language filter ('php', 'javascript', etc.).
-                node_type: Optional type filter ('class', 'function', 'method').
-            """
-            limit = min(limit, 20)
-            results = qdrant.search_code_mmr(
-                query,
-                limit=limit,
-                language=language or None,
-                node_type=node_type or None,
-            )
-
-            if not results:
-                return f"No code matching '{query}' found."
-
-            lines = []
-            for r in results:
-                score = r.get("score", 0)
-                lines.append(
-                    f"[{score:.2f}] {r.get('type', '?')}: {r.get('name', '?')} "
-                    f"({r.get('file', '?')}:{r.get('lines', '?')})"
-                )
-                if r.get("summary"):
-                    lines.append(f"  {r['summary']}")
-
-            return "\n".join(lines)
-
-    @mcp.tool(
-        name="search_code_hybrid",
-        description=(
-            "Best default search. Combines BM25 (catches exact identifiers like method names) "
-            "with semantic embeddings (catches conceptual matches), merged via RRF. "
-            "Use when the query mixes exact terms and concepts: 'sendPersonalInvite email logic'. "
-            "Pure semantic search misses exact names; pure keyword misses synonyms — this does both."
-        ),
-    )
+    @mcp.tool(name="search_code_hybrid", description=hybrid_description)
     def search_code_hybrid(
-        query: str,
-        limit: int = 10,
-        language: str = "",
-        node_type: str = "",
+        query: Annotated[
+            str,
+            Field(description="Keywords or natural-language description of the code you want."),
+        ],
+        limit: Annotated[
+            int, Field(description="Maximum results to return; capped at 20.")
+        ] = 10,
+        language: LanguageFilter = None,
+        node_type: NodeTypeFilter = None,
     ) -> str:
-        """Hybrid BM25 + semantic code search with RRF fusion.
-
-        Args:
-            query: Keywords or natural language description.
-            limit: Maximum results to return (capped at 20).
-            language: Optional language filter.
-            node_type: Optional type filter ('class', 'function', 'method').
-        """
+        """Hybrid BM25 + semantic code search with RRF fusion."""
         from hammy.tools.hybrid_search import hybrid_search
 
         limit = min(limit, 20)
@@ -1462,8 +1514,8 @@ def create_mcp_server(
             bm25_index=bm25_cache[0],
             qdrant=qdrant,
             limit=limit,
-            language=language or None,
-            node_type=node_type or None,
+            language=language,
+            node_type=node_type,
         )
 
         if not results:
@@ -1481,6 +1533,8 @@ def create_mcp_server(
 
         return "\n".join(lines)
 
+    # --- Memory / Brain Tools (require Qdrant) ---
+
     if qdrant is not None:
 
         @mcp.tool(
@@ -1495,26 +1549,41 @@ def create_mcp_server(
             ),
         )
         def store_context(
-            key: str,
-            content: str,
-            tags: str = "",
-            source_files: str = "",
-            ttl_days: int = 0,
+            key: Annotated[
+                str,
+                Field(
+                    description=(
+                        "Unique identifier for this entry, e.g. 'payment-flow-research'. "
+                        "Re-using a key overwrites the existing entry."
+                    )
+                ),
+            ],
+            content: Annotated[
+                str, Field(description="The discovered information to store.")
+            ],
+            tags: Annotated[
+                list[str] | None,
+                Field(description="Labels for grouping, e.g. ['payment', 'sprint-42']."),
+            ] = None,
+            source_files: Annotated[
+                list[str] | None,
+                Field(description="File paths this entry relates to."),
+            ] = None,
+            ttl_days: Annotated[
+                int,
+                Field(
+                    description=(
+                        "Days until this entry auto-expires; 0 = never. Use for "
+                        "time-sensitive findings like sprint context or PR-specific notes."
+                    )
+                ),
+            ] = 0,
         ) -> str:
-            """Store a finding in the brain.
-
-            Args:
-                key: Unique identifier for this entry (e.g. 'payment-flow-research').
-                content: The discovered information to store.
-                tags: Comma-separated labels for grouping (e.g. 'payment,sprint-42').
-                source_files: Comma-separated file paths this entry relates to.
-                ttl_days: Days until this entry expires (0 = never expires). Use for
-                          time-sensitive findings like sprint context or PR-specific notes.
-            """
+            """Store a finding in the brain."""
             from datetime import datetime, timedelta, timezone
 
-            tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
-            file_list = [f.strip() for f in source_files.split(",") if f.strip()] if source_files else []
+            tag_list = [t.strip() for t in (tags or []) if t.strip()]
+            file_list = [f.strip() for f in (source_files or []) if f.strip()]
 
             expires_at = None
             if ttl_days > 0:
@@ -1529,26 +1598,29 @@ def create_mcp_server(
         @mcp.tool(
             name="recall_context",
             description=(
-                "CALL THIS FIRST before researching anything. Check what's already been stored so you "
-                "don't repeat work that was already done. Fetch by exact key for direct lookup, or pass "
-                "a natural language query to find semantically related findings. Also use when handing "
-                "off between sub-agents — the prior agent's findings are here."
+                "Check stored research before starting new research on a topic — a prior session "
+                "or sub-agent may already have the answer, so don't repeat work. Fetch by exact "
+                "key for direct lookup, or pass a natural-language query to find semantically "
+                "related findings. Also use when handing off between sub-agents."
             ),
         )
         def recall_context(
-            query: str = "",
-            key: str = "",
-            tag: str = "",
-            limit: int = 5,
+            query: Annotated[
+                str,
+                Field(description="Natural-language query to find related findings."),
+            ] = "",
+            key: Annotated[
+                str,
+                Field(description="Exact key for direct lookup; takes priority over query."),
+            ] = "",
+            tag: Annotated[
+                str, Field(description="Restrict results to entries with this tag.")
+            ] = "",
+            limit: Annotated[
+                int, Field(description="Maximum results for semantic search; capped at 10.")
+            ] = 5,
         ) -> str:
-            """Retrieve brain entries by key or semantic query.
-
-            Args:
-                query: Natural language query to find related findings.
-                key: Exact key for direct lookup (takes priority over query).
-                tag: Optional tag to restrict results.
-                limit: Max results for semantic search.
-            """
+            """Retrieve brain entries by key or semantic query."""
             if not query and not key:
                 return "Provide either a key (exact lookup) or a query (semantic search)."
 
@@ -1579,18 +1651,18 @@ def create_mcp_server(
         @mcp.tool(
             name="list_context",
             description=(
-                "See all stored memory entries with their keys and summaries. "
-                "Use at the start of a session to discover what's already been researched — "
-                "then use recall_context(key='...') to load the full content of anything relevant. "
+                "See all stored memory entries with their keys and summaries — useful for "
+                "discovering what's already been researched. Then use recall_context(key='...') "
+                "to load the full content of anything relevant. "
                 "Filter by tag to scope to a specific feature or sprint."
             ),
         )
-        def list_context(tag: str = "") -> str:
-            """List stored brain entries.
-
-            Args:
-                tag: Optional tag to restrict results.
-            """
+        def list_context(
+            tag: Annotated[
+                str, Field(description="Restrict results to entries with this tag.")
+            ] = "",
+        ) -> str:
+            """List stored brain entries."""
             from datetime import datetime, timezone
 
             entries = qdrant.list_brain_entries(tag=tag)
@@ -1646,12 +1718,12 @@ def create_mcp_server(
                 "removed entirely."
             ),
         )
-        def forget_context(key: str) -> str:
-            """Delete a brain entry by key.
-
-            Args:
-                key: Exact key of the entry to delete.
-            """
+        def forget_context(
+            key: Annotated[
+                str, Field(description="Exact key of the entry to delete.")
+            ],
+        ) -> str:
+            """Delete a brain entry by key."""
             existing = qdrant.search_brain(key=key)
             if not existing:
                 return f"No brain entry found for key '{key}'."
@@ -1667,13 +1739,16 @@ def create_mcp_server(
                 "doesn't use your exact words."
             ),
         )
-        def search_commits(query: str, limit: int = 10) -> str:
-            """Semantic commit search via Qdrant.
-
-            Args:
-                query: Natural language description of what you're looking for.
-                limit: Maximum results to return.
-            """
+        def search_commits(
+            query: Annotated[
+                str,
+                Field(description="Natural-language description of the change you're looking for."),
+            ],
+            limit: Annotated[
+                int, Field(description="Maximum results to return.")
+            ] = 10,
+        ) -> str:
+            """Semantic commit search via Qdrant."""
             results = qdrant.search_commits(query, limit=limit)
 
             if not results:
@@ -1696,7 +1771,7 @@ def create_mcp_server(
 
     @mcp.resource(
         "hammy://status",
-        name="index_status",
+        name="status",
         description="Current Hammy index status and statistics.",
         mime_type="text/plain",
     )

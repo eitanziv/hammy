@@ -75,7 +75,7 @@ After you install the CLI tool, you can run these commands:
 hammy init /path/to/your/project
 ```
 
-This will create a `config/` folder and 3 config files: `hammy.yaml`, `agents.yaml`, `tasks.yaml` and a `.hammyignore` file. You must configure the `agents.yaml` file to use hammy and to index your codebase.
+This will create a `config/` folder and 3 config files: `hammy.yaml`, `agents.yaml`, `tasks.yaml`, a `.hammyignore` file, and a `HAMMY.md` agent guide (see [Wiring up your AI agent](#wiring-up-your-ai-agent)). You must configure the `agents.yaml` file to use hammy and to index your codebase.
 
 ```bash
 # Index the codebase
@@ -94,6 +94,20 @@ hammy watch
 
 ---
 
+## Wiring up your AI agent
+
+Connecting the MCP server isn't enough on its own — coding agents default to grep and file reading out of habit, and only discover Hammy's tools if they're told when to reach for them. `hammy init` sets up two things to fix that:
+
+**`HAMMY.md`** — a routing guide written into your project root: which tool to use for which question, the pre-change workflow (`impact_analysis` → `hotspot_score`), and when to fall back to grep. Hammy never touches your existing agent files; instead, add one line to your `CLAUDE.md`, `AGENTS.md`, `.cursorrules`, or `CONTEXT.md`:
+
+> This project is indexed by the `hammy` MCP server. Read HAMMY.md before navigating, searching, or modifying code.
+
+**A Claude Code skill** — `.claude/skills/hammy/SKILL.md`, installed automatically when your project has a `.claude/` directory (or with `hammy init --claude-skill`). Its trigger description fires on code-navigation phrasing ("where is this called?", "is this safe to change?") and points the agent at HAMMY.md and the right tools at exactly the moment it would otherwise reach for grep.
+
+The two work together: the reference line makes agents load HAMMY.md at session start, and the skill re-surfaces it mid-session when a navigation question comes up. Both are plain files — edit them to match how your team works.
+
+---
+
 ## MCP Tools
 
 All tools are available via `hammy serve` to any MCP client. Grouped by what you're trying to do:
@@ -101,7 +115,7 @@ All tools are available via `hammy serve` to any MCP client. Grouped by what you
 ### Orientation — understand unfamiliar code fast
 
 #### `explain_symbol` ⭐
-**The single most useful tool.** One call returns everything about a symbol: full definition (file, line, params, return type, visibility, async, LLM summary), direct callers, direct callees, sibling symbols in the same file, and recent commits. Replaces `lookup_symbol` + `find_usages` + `impact_analysis` + `ast_query` in a single round trip.
+**The single most useful tool.** One call returns a 360° view of a symbol: full definition (file, line, params, return type, visibility, async, LLM summary), direct callers, direct callees, sibling symbols in the same file, and recent commits. Best first move when investigating any symbol — then escalate to `find_usages` for the complete call-site list or `impact_analysis` for multi-hop blast radius.
 
 ```
 explain_symbol("PaymentService")
@@ -130,18 +144,15 @@ List every indexed file with its language. Good first call on an unfamiliar proj
 Keyword search over symbol names, ranked by match quality (exact → prefix → substring → summary). Use when you know roughly what you're looking for but not the exact name.
 
 #### `lookup_symbol`
-You know the exact name — get the full definition immediately: file, line range, params, return type, visibility, async flag, and LLM summary. Falls back to word-boundary match if no exact hit.
-
-#### `lookup_symbols_batch`
-Look up multiple symbols in one call. Pass a comma-separated list, get all definitions back at once. Eliminates the `lookup_symbol` loop after a search result.
+You know the exact name — get the full definition immediately: file, line range, params, return type, visibility, async flag, and LLM summary. Accepts up to 20 names per call, so after a search you can drill into every interesting result at once. Falls back to word-boundary match if no exact hit.
 
 ```
-lookup_symbols_batch("UserController, PaymentService, getRenew")
+lookup_symbol(["UserController", "PaymentService", "getRenew"])
 → 3 full definitions in one call
 ```
 
 #### `search_code_hybrid`
-Combines BM25 (exact identifiers) with semantic embeddings (conceptual matches), merged via RRF. Use when your query mixes exact terms and concepts: `"sendPersonalInvite email logic"`. Requires Qdrant.
+Combines BM25 (exact identifiers) with semantic embeddings (conceptual matches), merged via RRF. Use when your query mixes exact terms and concepts: `"sendPersonalInvite email logic"`. Without Qdrant it degrades gracefully to keyword-only (BM25) search.
 
 #### `structural_search`
 Find symbols by shape, not name. Useful for refactoring sprints and code reviews.
@@ -161,7 +172,7 @@ Parameters: `node_type`, `language`, `visibility`, `async_only`, `min_params`, `
 ### Call Graph — trace dependencies
 
 #### `find_usages`
-Find every call site for a function or method. Word-boundary matched so `save` won't match `saveAll`. Now with `argument_filter` to narrow by what's passed in — critical for dependency-injection heavy codebases.
+Find every call site for a function or method. Pass the bare name (`charge`, not `PaymentService::charge`) — call expressions only contain the bare name. Word-boundary matched so `save` won't match `saveAll`. Now with `argument_filter` to narrow by what's passed in — critical for dependency-injection heavy codebases.
 
 ```
 find_usages("resolve", argument_filter="PaymentService")
@@ -226,7 +237,7 @@ Save a research finding to persistent memory with a key, tags, and source files.
 store_context(
   key="auth-flow-research",
   content="Authentication touches 40 files. Entry point is AuthController::login...",
-  tags="auth,sprint-42"
+  tags=["auth", "sprint-42"]
 )
 ```
 
@@ -260,7 +271,7 @@ impact_analysis("charge", depth=3)                    # map the blast radius
 **Exploring an unfamiliar module:**
 ```
 module_summary("app/Services/Payment/")              # table of contents
-lookup_symbols_batch("PaymentService, Webhook, StripeClient")  # drill into key symbols
+lookup_symbol(["PaymentService", "Webhook", "StripeClient"])  # drill into key symbols
 ```
 
 **Before merging a PR:**

@@ -68,7 +68,6 @@ class TestMCPServerCreation:
         assert "pr_diff" in tool_names
         assert "explain_symbol" in tool_names
         assert "module_summary" in tool_names
-        assert "lookup_symbols_batch" in tool_names
         assert "search_comments" in tool_names
 
     @pytest.mark.asyncio
@@ -229,7 +228,7 @@ class TestLookupSymbol:
     @pytest.mark.asyncio
     async def test_lookup_exact(self, mcp_server):
         result = await mcp_server.call_tool(
-            "lookup_symbol", {"name": "UserController"}
+            "lookup_symbol", {"names": ["UserController"]}
         )
         text = _extract_text(result)
         assert "UserController" in text
@@ -238,7 +237,7 @@ class TestLookupSymbol:
     @pytest.mark.asyncio
     async def test_lookup_not_found(self, mcp_server):
         result = await mcp_server.call_tool(
-            "lookup_symbol", {"name": "zzz_totally_missing"}
+            "lookup_symbol", {"names": ["zzz_totally_missing"]}
         )
         text = _extract_text(result)
         assert "not found" in text.lower() or "search_symbols" in text
@@ -246,10 +245,25 @@ class TestLookupSymbol:
     @pytest.mark.asyncio
     async def test_lookup_with_node_type(self, mcp_server):
         result = await mcp_server.call_tool(
-            "lookup_symbol", {"name": "UserController", "node_type": "class"}
+            "lookup_symbol", {"names": ["UserController"], "node_type": "class"}
         )
         text = _extract_text(result)
         assert "UserController" in text
+
+    @pytest.mark.asyncio
+    async def test_lookup_multiple_names(self, mcp_server):
+        result = await mcp_server.call_tool(
+            "lookup_symbol", {"names": ["UserController", "zzz_missing"]}
+        )
+        text = _extract_text(result)
+        assert "UserController" in text
+        assert "not found" in text
+
+    @pytest.mark.asyncio
+    async def test_lookup_empty_names(self, mcp_server):
+        result = await mcp_server.call_tool("lookup_symbol", {"names": []})
+        text = _extract_text(result)
+        assert "Provide at least one" in text
 
 
 class TestFindUsages:
@@ -625,7 +639,7 @@ class TestBrainTools:
             result = await server.call_tool("store_context", {
                 "key": "test-finding",
                 "content": "getRenew called from 3 places.",
-                "tags": "research",
+                "tags": ["research"],
             })
             assert "test-finding" in _extract_text(result)
             # Recall by key
@@ -794,6 +808,80 @@ class TestExplainSymbol:
         assert "not found" in text
 
 
+class TestMethodCallerResolution:
+    """Regression: methods have qualified node names ('Class.method'), but call
+    expressions only contain the bare name. explain_symbol/impact_analysis used
+    to miss callers/callees of dot-qualified methods entirely."""
+
+    @pytest.fixture(scope="class")
+    def py_server(self, tmp_path_factory):
+        tmp_path = tmp_path_factory.mktemp("hammy_py")
+        (tmp_path / "manager.py").write_text(
+            "class QdrantManager:\n"
+            "    def search_code(self, query):\n"
+            "        return query\n"
+        )
+        (tmp_path / "search.py").write_text(
+            "def hybrid_search(qdrant, query):\n"
+            "    return qdrant.search_code(query)\n"
+        )
+        config_dir = tmp_path / "config"
+        config_dir.mkdir()
+        (config_dir / "hammy.yaml").write_text(
+            "project:\n  name: py-test\n  root: .\n"
+            "parsing:\n  languages:\n    - python\n"
+        )
+        config = HammyConfig.load(tmp_path)
+        return create_mcp_server(project_root=tmp_path, config=config)
+
+    @pytest.mark.asyncio
+    async def test_explain_symbol_finds_method_callers(self, py_server):
+        """Caller matching must use the bare name, not 'QdrantManager.search_code'."""
+        result = await py_server.call_tool("explain_symbol", {"name": "search_code"})
+        text = _extract_text(result)
+        assert "QdrantManager.search_code" in text
+        callers_section = text.split("Callers")[1].split("Callees")[0]
+        assert "none found" not in callers_section
+        assert "hybrid_search" in callers_section
+
+    @pytest.mark.asyncio
+    async def test_explain_symbol_resolves_method_callees(self, py_server):
+        """Bare callee names extracted from call text must resolve to method nodes."""
+        result = await py_server.call_tool("explain_symbol", {"name": "hybrid_search"})
+        text = _extract_text(result)
+        callees_section = text.split("Callees")[1].split("Siblings")[0]
+        assert "search_code" in callees_section
+
+    @pytest.mark.asyncio
+    async def test_impact_analysis_finds_method_callers(self, py_server):
+        result = await py_server.call_tool(
+            "impact_analysis", {"symbol_name": "search_code", "direction": "callers"}
+        )
+        text = _extract_text(result)
+        assert "hybrid_search" in text
+
+    @pytest.mark.asyncio
+    async def test_impact_analysis_callees_finds_method_definition(self, py_server):
+        """Bare method name must locate the qualified definition for callee traversal."""
+        result = await py_server.call_tool(
+            "impact_analysis", {"symbol_name": "search_code", "direction": "callees"}
+        )
+        text = _extract_text(result)
+        assert "Definition of 'search_code' not found" not in text
+
+    @pytest.mark.asyncio
+    async def test_explain_and_find_usages_agree(self, py_server):
+        """The two tools use the same matching semantics — no more discrepancy."""
+        usages = _extract_text(
+            await py_server.call_tool("find_usages", {"symbol_name": "search_code"})
+        )
+        explained = _extract_text(
+            await py_server.call_tool("explain_symbol", {"name": "search_code"})
+        )
+        assert "hybrid_search" in usages
+        assert "hybrid_search" in explained
+
+
 class TestModuleSummary:
     @pytest.mark.asyncio
     async def test_module_summary_registered(self, mcp_server):
@@ -815,38 +903,6 @@ class TestModuleSummary:
         text = _extract_text(result)
         # Should return some module output or no-symbols message
         assert len(text) > 0
-
-
-class TestLookupSymbolsBatch:
-    @pytest.mark.asyncio
-    async def test_lookup_symbols_batch_registered(self, mcp_server):
-        tools = await mcp_server.list_tools()
-        tool_names = {t.name for t in tools}
-        assert "lookup_symbols_batch" in tool_names
-
-    @pytest.mark.asyncio
-    async def test_lookup_symbols_batch_found(self, mcp_server):
-        result = await mcp_server.call_tool(
-            "lookup_symbols_batch", {"names": "UserController"}
-        )
-        text = _extract_text(result)
-        assert "UserController" in text
-        assert "file:" in text
-
-    @pytest.mark.asyncio
-    async def test_lookup_symbols_batch_multiple(self, mcp_server):
-        result = await mcp_server.call_tool(
-            "lookup_symbols_batch", {"names": "UserController, zzz_missing"}
-        )
-        text = _extract_text(result)
-        assert "UserController" in text
-        assert "not found" in text
-
-    @pytest.mark.asyncio
-    async def test_lookup_symbols_batch_empty(self, mcp_server):
-        result = await mcp_server.call_tool("lookup_symbols_batch", {"names": ""})
-        text = _extract_text(result)
-        assert "Provide at least one" in text
 
 
 class TestPrDiffWorkingTree:
